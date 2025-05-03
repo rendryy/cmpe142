@@ -35,6 +35,7 @@ typedef struct
     int q_size;
     int count;
     int running;
+    int done;
     char messages[BUFFER_SIZE];
 }queue_t;
 
@@ -141,10 +142,11 @@ int main(int argc, char *argv[])
     empty = sem_open(SEM_EMPTY, O_CREAT, 0666, q_depth); 
     mutex = sem_open(SEM_MUTEX, O_CREAT, 0666, 1);
 
-
+    //error handling for semaphores
+    //check for existing semaphores
     if (empty == SEM_FAILED && errno == EEXIST) 
     {
-        empty = sem_open("/my_semaphore", 0); // Open existing
+        empty = sem_open("/my_semaphore", 0); 
     }
 
     if (mutex == SEM_FAILED || full == SEM_FAILED || empty == SEM_FAILED) 
@@ -202,9 +204,6 @@ int main(int argc, char *argv[])
         sem_close(full);
         sem_close(empty);
         sem_close(mutex);
-        
-        printf("Producer finished. Start consumer to process the data.\n");
-        return 0; // Exit without calling cleanup()
     }
     
     //consumer for shared memory
@@ -212,9 +211,9 @@ int main(int argc, char *argv[])
     {
         create_sharedmem(q_depth);
         consumer_shared(q_depth, e_arg);
-        cleanup(); // Only consumer does full cleanup
+        cleanup(); 
     }
-    // Only call cleanup here for unix socket mode
+    // 
     else if (u_arg) {
         cleanup();
     }
@@ -226,7 +225,7 @@ int main(int argc, char *argv[])
 //producer function for unix sockets
 void producer_socket(bool e, const char *m, int q)
 {
-    //UNIX domain socket 
+    //UNIX domain socket address struct
     struct sockaddr_un addr;
     //queue size 
     for(int i = 0; i < q; i++)
@@ -234,13 +233,15 @@ void producer_socket(bool e, const char *m, int q)
         int prod_fd;
         //set socket address
         memset(&addr, 0, sizeof(struct sockaddr_un));
+        //set to UNIX socket domain
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, SOCKET_NAME, sizeof(addr.sun_path) - 1);
         char buffer[BUFFER_SIZE];
         //socket creation
-        //loop for connection attempt if producer is ran first to retry connection until consumer
+        //retry loop 
         while (1) 
         {
+            //create socket
             prod_fd = socket(AF_UNIX, SOCK_STREAM, 0);
             if (prod_fd < 0) 
             {
@@ -252,18 +253,18 @@ void producer_socket(bool e, const char *m, int q)
             if(connect(prod_fd, (const struct sockaddr *) &addr, sizeof(struct sockaddr_un)) == -1)
             {
                 perror("Connect failed, waiting for consumer");
-                //sleep(1) so while its waiting to connect to consumer, it doesn't spam the terminal
+                //delay to prevent terminal spam from continuous retries
                 sleep(1);
                 close(prod_fd);
             }
-            //if connected, break out of retry loop
+            //once connected, exit retry loop as it has a connection
             else
             {
                 break;
             }
         }
 
-        //send message
+        //send message through socket
         if(write(prod_fd, m, strlen(m)) < 0)
         {
             perror("Write failed");
@@ -284,6 +285,7 @@ void consumer_socket(bool e, int q)
 {
     int prod_fd, con_fd;
     struct sockaddr_un addr;
+    //message buffer
     char buffer[BUFFER_SIZE];
     //socket creation
     if((prod_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
@@ -291,29 +293,31 @@ void consumer_socket(bool e, int q)
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
-    //set socket address
+    //initialize scocket address struct and Unix Socket
     memset(&addr, 0, sizeof(struct sockaddr_un));
     addr.sun_family = AF_UNIX;
-
     strncpy(addr.sun_path, SOCKET_NAME, sizeof(addr.sun_path) - 1);
     
+    //remove existing sockets
     unlink(SOCKET_NAME);
-
+    //bind socket to address
     if(bind(prod_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)))
     {
         perror("Bind failed");
         close(prod_fd);
         exit(EXIT_FAILURE);
     }
-
+    //listen for connections
     if(listen(prod_fd, 5) == -1)
     {
         perror("Listen failed");
         close(prod_fd);
         exit(EXIT_FAILURE);
     }
+    //iterate through queue
     for (int i = 0; i < q; i++)
     {
+        //accept incoming connection
         con_fd = accept(prod_fd, NULL, NULL);
         if(con_fd == -1)
         {
@@ -321,8 +325,9 @@ void consumer_socket(bool e, int q)
             close(prod_fd);
             exit(EXIT_FAILURE);
         }
+        //clear buffer
         memset(buffer, 0, BUFFER_SIZE);
-    
+        //read message
         if(read(con_fd, buffer, BUFFER_SIZE - 1) > 0 )
         {
             if(e)
@@ -342,48 +347,73 @@ void consumer_socket(bool e, int q)
 }
 
 
-//function to create section of shared memory
+//function to create shared memory 
 void create_sharedmem(int q)
 {
+    //open shared memory segment
     int shm_fd = shm_open(SHM_NAME, O_CREAT| O_RDWR, 0666);
     if (shm_fd == -1) 
     {
         perror("shm_open failed");
         exit(EXIT_FAILURE);
     }
-    //total_size is adjusted based on queue size
-    size_t total_size = sizeof(queue_t) + (q * BUFFER_SIZE);
-    struct stat shm_info;
+    
+    //check for existing shared memory size 
+    struct stat shm_stat;
+    if (fstat(shm_fd, &shm_stat) == -1) {
+        perror("fstat failed");
+        exit(EXIT_FAILURE);
+    }
+    
+    int queue = 0;
+    size_t req_size = sizeof(queue_t) + (q * BUFFER_SIZE);
+    size_t size = shm_stat.st_size;
+    
+    // If shared memory already exists, determine its queue size
+    if (size > sizeof(queue_t)) 
+    {
+        queue_t *temp = mmap(NULL, sizeof(queue_t), PROT_READ, MAP_SHARED, shm_fd, 0);
+        if (temp == MAP_FAILED) 
+        {
+            perror("mmap failed during size check");
+            exit(EXIT_FAILURE);
+        }
+        queue = temp->q_size;
+        munmap(temp, sizeof(queue_t));
+        
+        //determine max queue size 
+        int max_q_size;
+        if (queue > q)
+        {
+            max_q_size = queue;
+        }
+        else
+        {
+            max_q_size = q;
+        }
 
-    // If shared memory exists with wrong size, recreate it
-    if (shm_info.st_size > 0 && shm_info.st_size != total_size) 
+        req_size = sizeof(queue_t) + (max_q_size * BUFFER_SIZE);
+    }
+
+    //resize if needed 
+    if (req_size > size) 
     {
-        printf("Recreating shared memory with new size...\n");
-        if (ftruncate(shm_fd, 0) == -1) {  // Truncate to 0
-            perror("ftruncate(0) failed");
-            exit(EXIT_FAILURE);
-        }
-        if (ftruncate(shm_fd, total_size) == -1) {
-            perror("ftruncate(new size) failed");
-            exit(EXIT_FAILURE);
-        }
-    } else if (shm_info.st_size == 0) 
-    {
-        // New shared memory
-        if (ftruncate(shm_fd, total_size) == -1) 
+        if (ftruncate(shm_fd, req_size) == -1) 
         {
             perror("ftruncate failed");
             exit(EXIT_FAILURE);
         }
     }
-
-    q_t = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    //map shared memory 
+    q_t = mmap(NULL, req_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (q_t == MAP_FAILED) 
     {
         perror("mmap failed");
         exit(EXIT_FAILURE);
     }
+    //initialize shared memory
     sem_wait(mutex);
+    //if running for first time, initialize 
     if(q_t->running == 0)
     {
         q_t->head = 0;
@@ -391,31 +421,36 @@ void create_sharedmem(int q)
         q_t->q_size = q;
         q_t->count = 0;
         q_t->running = 1;
+        //initalize all message slots
         for (int i = 0; i < q; i++) 
         {
             memset(&q_t->messages[i * BUFFER_SIZE], 0, BUFFER_SIZE);
         }
 
     }
-    else if (q != q_t->q_size) 
-    {
-        fprintf(stderr, "Mismatch: Shared memory already initialized with q_size = %d, but received q = %d\n", q_t->q_size, q);
-        sem_post(mutex);
-        cleanup();
-        exit(EXIT_FAILURE);
+    else if (q > q_t->q_size) 
+    {     
+        // initialize new message slots
+        for (int i = q_t->q_size; i < q; i++) 
+        {
+            memset(&q_t->messages[i * BUFFER_SIZE], 0, BUFFER_SIZE);
+        }
+        
+        q_t->q_size = q;
     }
+    //increment process count 
     q_t->count++;
     sem_post(mutex);
 }
 
-//function for producer in shared memory, iterates through queue size and produces messages 
 void producer_shared(const char *m, int q, bool e)
 {
+    //iterate for q size 
     for(int i = 0; i < q; i++)
     {
         sem_wait(empty);
         sem_wait(mutex);
-
+        //copy message into queue and update pointer head 
         strncpy(&q_t->messages[q_t->head * BUFFER_SIZE], m, BUFFER_SIZE - 1);
         q_t->messages[q_t->head * BUFFER_SIZE + BUFFER_SIZE - 1] = '\0';
         q_t->head = (q_t->head +1) % q_t->q_size;
@@ -427,58 +462,81 @@ void producer_shared(const char *m, int q, bool e)
         sem_post(full);
 
     }
+    //signal completion
+    sem_wait(mutex);
+    q_t->done = 1;
+    sem_post(mutex);
 }
 
-//function for consumer in shared memory, iterarates through queue size and consumes messages in shared memory
 void consumer_shared(int q, bool e)
 {
+    //iterate to consume q messages
     for(int i = 0; i < q; i++)
     {
-        sem_wait(full);
-        sem_wait(mutex);
+        //wait for item and lock queue
+        sem_wait(full);       
+        sem_wait(mutex);      
+
+        // Verify tail is within bounds
+        if (q_t->tail >= q_t->q_size) {
+            fprintf(stderr, "Error: Invalid tail position %d (q_size=%d)\n", 
+                    q_t->tail, q_t->q_size);
+            exit(EXIT_FAILURE);
+        }
+
+        // Calculate message position 
+        char *msg_ptr = &q_t->messages[q_t->tail * BUFFER_SIZE];
+        
+        // Copy message
         char m[BUFFER_SIZE];
+        strncpy(m, msg_ptr, BUFFER_SIZE - 1);
+        m[BUFFER_SIZE - 1] = '\0';  // Ensure null-termination
 
-        strncpy(m, &q_t->messages[q_t->tail * BUFFER_SIZE], BUFFER_SIZE - 1);
-
-        m[BUFFER_SIZE - 1] = '\0';
+        // Update tail 
         q_t->tail = (q_t->tail + 1) % q_t->q_size;
+
         if (e) 
         {
             printf("Consumer Received: %s\n", m);
         }
-        sem_post(mutex);
-        sem_post(empty);
+        
+        sem_post(mutex);     
+        sem_post(empty);   
     }
 }
 
-
-//function to cleanup semaphores after program runs 
+//clean up everything 
 void cleanup()
 {
-    // Check if q_t is initialized (only happens in shared memory mode)
-    if (q_t != NULL) {
+    // Check if q_t was initialized
+    if (q_t != NULL) 
+    {
+        //update process count
         sem_wait(mutex);
         q_t->count--;
-        int should_clean = (q_t->count == 0);
+        //only clean if process count has reached 0
+        int clean = (q_t->count == 0);
         sem_post(mutex);
-
-        if (should_clean) {
-            printf("Cleaning up shared memory resources...\n");
-            size_t total_size = sizeof(queue_t) + (q_t->q_size * BUFFER_SIZE);
-            munmap(q_t, total_size);
+        //unlink everything
+        //if last process, clean everything
+        if (clean) 
+        {
+            size_t size = sizeof(queue_t) + (q_t->q_size * BUFFER_SIZE);
+            munmap(q_t, size);
             shm_unlink(SHM_NAME);
             
-            // Also unlink semaphores since we're the last process
             sem_unlink(SEM_FULL);
             sem_unlink(SEM_EMPTY);
             sem_unlink(SEM_MUTEX);
         }
         
-        // Close the semaphores in any case
+        //close semaphores
         sem_close(full);
         sem_close(empty);
         sem_close(mutex);
-    } else {
+    } 
+    else 
+    {
         // For unix socket mode, close and unlink semaphores
         sem_close(full);
         sem_close(empty);
