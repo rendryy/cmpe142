@@ -11,6 +11,9 @@
 #include <sys/un.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <getopt.h>
+#include <sys/stat.h>
+
 
 //constant definitions
 #define SOCKET_NAME "/tmp/pc.sock"
@@ -129,7 +132,7 @@ int main(int argc, char *argv[])
                 strncpy(msg, optarg, BUFFER_SIZE - 1);
                 break;
             default:
-                fprintf(stderr, "Usage: -p/-c -q <depth> -u/-s -e -m <message>\n ", argv[0]);
+                fprintf(stderr, "Usage: %s -p/-c -q <depth> -u/-s -e -m <message>\n ", argv[0]);
 
         }
     }
@@ -192,13 +195,30 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Error: -p requires -m\n ");
             exit(EXIT_FAILURE);
         }
+        create_sharedmem(q_depth);
         producer_shared(msg, q_depth, e_arg);
+        
+        // Only close the semaphores but don't unlink them
+        sem_close(full);
+        sem_close(empty);
+        sem_close(mutex);
+        
+        printf("Producer finished. Start consumer to process the data.\n");
+        return 0; // Exit without calling cleanup()
     }
+    
     //consumer for shared memory
     if(is_con && s_arg)
     {
+        create_sharedmem(q_depth);
         consumer_shared(q_depth, e_arg);
+        cleanup(); // Only consumer does full cleanup
     }
+    // Only call cleanup here for unix socket mode
+    else if (u_arg) {
+        cleanup();
+    }
+    
     cleanup();
     return 0;
 }
@@ -333,11 +353,28 @@ void create_sharedmem(int q)
     }
     //total_size is adjusted based on queue size
     size_t total_size = sizeof(queue_t) + (q * BUFFER_SIZE);
+    struct stat shm_info;
 
-    if(ftruncate(shm_fd, total_size) == -1)
+    // If shared memory exists with wrong size, recreate it
+    if (shm_info.st_size > 0 && shm_info.st_size != total_size) 
     {
-        perror("ftruncate failed");
-        exit(EXIT_FAILURE);
+        printf("Recreating shared memory with new size...\n");
+        if (ftruncate(shm_fd, 0) == -1) {  // Truncate to 0
+            perror("ftruncate(0) failed");
+            exit(EXIT_FAILURE);
+        }
+        if (ftruncate(shm_fd, total_size) == -1) {
+            perror("ftruncate(new size) failed");
+            exit(EXIT_FAILURE);
+        }
+    } else if (shm_info.st_size == 0) 
+    {
+        // New shared memory
+        if (ftruncate(shm_fd, total_size) == -1) 
+        {
+            perror("ftruncate failed");
+            exit(EXIT_FAILURE);
+        }
     }
 
     q_t = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
@@ -364,6 +401,7 @@ void create_sharedmem(int q)
     {
         fprintf(stderr, "Mismatch: Shared memory already initialized with q_size = %d, but received q = %d\n", q_t->q_size, q);
         sem_post(mutex);
+        cleanup();
         exit(EXIT_FAILURE);
     }
     q_t->count++;
@@ -413,26 +451,40 @@ void consumer_shared(int q, bool e)
     }
 }
 
+
 //function to cleanup semaphores after program runs 
 void cleanup()
 {
-    sem_wait(mutex);  // Protect the count decrement
-    q_t->count--;
-    int should_clean = (q_t->count == 0);
-    sem_post(mutex);
+    // Check if q_t is initialized (only happens in shared memory mode)
+    if (q_t != NULL) {
+        sem_wait(mutex);
+        q_t->count--;
+        int should_clean = (q_t->count == 0);
+        sem_post(mutex);
 
-    if (should_clean) 
-    {
+        if (should_clean) {
+            printf("Cleaning up shared memory resources...\n");
+            size_t total_size = sizeof(queue_t) + (q_t->q_size * BUFFER_SIZE);
+            munmap(q_t, total_size);
+            shm_unlink(SHM_NAME);
+            
+            // Also unlink semaphores since we're the last process
+            sem_unlink(SEM_FULL);
+            sem_unlink(SEM_EMPTY);
+            sem_unlink(SEM_MUTEX);
+        }
+        
+        // Close the semaphores in any case
+        sem_close(full);
+        sem_close(empty);
+        sem_close(mutex);
+    } else {
+        // For unix socket mode, close and unlink semaphores
         sem_close(full);
         sem_close(empty);
         sem_close(mutex);
         sem_unlink(SEM_FULL);
         sem_unlink(SEM_EMPTY);
         sem_unlink(SEM_MUTEX);
-        
-        size_t total_size = sizeof(queue_t) + (q_t->q_size * BUFFER_SIZE);
-        munmap(q_t, total_size);  // Must match original mapping size
-        shm_unlink(SHM_NAME);
     }
-
 }
